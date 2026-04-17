@@ -44,8 +44,13 @@ st.markdown("""
 # ── Sidebar ──────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.title("⚙️ Settings")
-    api_key = st.text_input("Glassnode API Key (optional)", type="password",
-                             help="Leave blank to use the free public tier.")
+    # Use secret if deployed on Streamlit Cloud, otherwise show input
+    default_key = st.secrets.get("GLASSNODE_API_KEY", "") if hasattr(st, "secrets") else ""
+    api_key = st.text_input("Glassnode API Key", type="password",
+                             value=default_key,
+                             help="Get a free key at studio.glassnode.com/settings/api")
+    if not api_key:
+        st.warning("⚠️ API key required. [Get a free key →](https://glassnode.com)", icon="🔑")
     days = st.selectbox("Lookback period", [7, 14, 30, 90], index=2)
     st.divider()
     st.caption("Data is fetched live from Glassnode on every load.")
