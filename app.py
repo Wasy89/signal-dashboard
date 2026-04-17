@@ -70,7 +70,7 @@ with st.spinner("Fetching data from CoinMetrics…"):
     # BTC: price, exchange supply, exchange flows, 1yr+ held supply, market cap
     df_btc = fetch_cm(
         "btc",
-        "PriceUSD,SplyExNtv,FlowInExNtv,FlowOutExNtv,SplyActEver1yr,CapMrktCurUSD",
+        "PriceUSD,SplyExNtv,FlowInExNtv,FlowOutExNtv,AdrActCnt,CapMrktCurUSD",
         start_s, end_s
     )
     # Stablecoins: exchange supply + market cap for SSR
@@ -85,7 +85,7 @@ btc_price    = col(df_btc, "PriceUSD")
 btc_reserve  = col(df_btc, "SplyExNtv")
 btc_inflow   = col(df_btc, "FlowInExNtv")
 btc_outflow  = col(df_btc, "FlowOutExNtv")
-btc_lth      = col(df_btc, "SplyActEver1yr")
+btc_adr      = col(df_btc, "AdrActCnt")
 btc_mcap     = col(df_btc, "CapMrktCurUSD")
 usdt_bal     = col(df_usdt, "SplyExNtv")
 usdc_bal     = col(df_usdc, "SplyExNtv")
@@ -111,14 +111,14 @@ def trend7(s):
 v_price      = latest(btc_price)
 v_reserve    = latest(btc_reserve)
 v_net_flow   = latest(btc_net_flow)
-v_lth        = latest(btc_lth)
+v_adr        = latest(btc_adr)
 v_usdt       = latest(usdt_bal)
 v_usdc       = latest(usdc_bal)
 v_stable     = latest(stable_total)
 v_ssr        = latest(ssr)
 
 t_reserve    = trend7(btc_reserve)   # negative = declining = bullish
-t_lth        = trend7(btc_lth)       # positive = rising = bullish
+t_adr        = trend7(btc_adr)       # positive = rising = bullish (more network activity)
 
 # ── Conviction score ──────────────────────────────────────────────────────────
 def conviction(signals):
@@ -128,7 +128,7 @@ def conviction(signals):
         p = val if bull else -val
         pts += p
         rows.append((label, f"+{p}" if p > 0 else str(p)))
-    if t_lth        is not None: add("LTH supply (1yr+ held) rising",    2, t_lth > 0)
+    if t_adr        is not None: add("Active addresses rising (7d)",     2, t_adr > 0)
     if v_net_flow   is not None: add("BTC exchange net outflow",          2, v_net_flow < 0)
     if t_reserve    is not None: add("Exchange reserve declining",        2, t_reserve < 0)
     if v_stable     is not None: add("Stablecoin reserves > $70B",        1, v_stable > 70e9)
@@ -173,11 +173,11 @@ with c0:
 
 p7 = (float(btc_price.iloc[-1]) / float(btc_price.iloc[-7]) - 1) * 100 if len(btc_price) >= 7 else None
 r7 = (t_reserve / float(btc_reserve.iloc[-7]) * 100) if t_reserve and not btc_reserve.empty and len(btc_reserve) >= 7 else None
-l7 = (t_lth / float(btc_lth.iloc[-7]) * 100) if t_lth and not btc_lth.empty and len(btc_lth) >= 7 else None
+a7 = (t_adr / float(btc_adr.iloc[-7]) * 100) if t_adr and not btc_adr.empty and len(btc_adr) >= 7 else None
 
-with c1: st.metric("BTC Price",         f"${v_price:,.0f}" if v_price else "N/A", f"{p7:+.1f}% (7d)" if p7 else None)
-with c2: st.metric("LTH Supply (1yr+)", fmt_btc(v_lth),  f"{l7:+.2f}% (7d)" if l7 else None)
-with c3: st.metric("Exchange Reserve",  fmt_btc(v_reserve), f"{r7:+.2f}% (7d)" if r7 else None, delta_color="inverse")
+with c1: st.metric("BTC Price",          f"${v_price:,.0f}" if v_price else "N/A", f"{p7:+.1f}% (7d)" if p7 else None)
+with c2: st.metric("Active Addresses",   f"{v_adr:,.0f}" if v_adr else "N/A",  f"{a7:+.2f}% (7d)" if a7 else None)
+with c3: st.metric("Exchange Reserve",   fmt_btc(v_reserve), f"{r7:+.2f}% (7d)" if r7 else None, delta_color="inverse")
 with c4: st.metric("Stablecoin Reserves", fmt_usd(v_stable), None)
 with c5: st.metric("SSR", f"{v_ssr:.2f}" if v_ssr else "N/A", "High buying power" if v_ssr and v_ssr < 6 else "Lower buying power", delta_color="normal" if v_ssr and v_ssr < 6 else "inverse")
 
@@ -216,7 +216,7 @@ with a:
     st.plotly_chart(chart(btc_price,    "Price (USD)",              "#f7931a", fmt="$,.0f"), use_container_width=True)
     st.plotly_chart(chart(btc_reserve,  "Exchange Reserve (BTC)",   "#ff6b6b", fmt=",.0f"),  use_container_width=True)
 with b:
-    st.plotly_chart(chart(btc_lth,      "LTH Supply — held 1yr+ (BTC)", "#00c896", fmt=",.0f"), use_container_width=True)
+    st.plotly_chart(chart(btc_adr,      "Active Addresses (daily)", "#00c896", fmt=",.0f"), use_container_width=True)
     st.plotly_chart(chart(btc_net_flow, "Exchange Net Flow (BTC)",  "#7eb3ff", fmt="+,.0f", zero_line=True), use_container_width=True)
 
 st.divider()
@@ -236,7 +236,7 @@ left, right = st.columns([3, 2])
 with left:
     st.subheader("🔎 Signal Summary")
     rows = [
-        ("LTH Supply (1yr+ held, 7d change)", f"{t_lth:+,.0f} BTC" if t_lth else "N/A",   sig(t_lth and t_lth > 0)    if t_lth is not None else "⚪ N/A"),
+        ("Active Addresses (7d change)",       f"{t_adr:+,.0f}" if t_adr else "N/A",        sig(t_adr and t_adr > 0)    if t_adr is not None else "⚪ N/A"),
         ("BTC Exchange Net Flow (latest day)", fmt_btc(v_net_flow),                          sig(v_net_flow and v_net_flow < 0) if v_net_flow is not None else "⚪ N/A"),
         ("Exchange Reserve (7d change)",       f"{t_reserve:+,.0f} BTC" if t_reserve else "N/A", sig(t_reserve and t_reserve < 0) if t_reserve is not None else "⚪ N/A"),
         ("Total Stablecoin Reserves",          fmt_usd(v_stable),                            sig(v_stable and v_stable > 70e9) if v_stable is not None else "⚪ N/A"),
@@ -272,7 +272,7 @@ with w1:
     st.markdown("**BTC**")
     st.markdown(f"- Exchange reserve **< 3.0M BTC** → {'🟢 already below' if v_reserve and v_reserve < 3e6 else '⚪ not yet reached'}")
     st.markdown(f"- Net flow turning **positive** for 3+ days → distribution warning 🔴")
-    st.markdown(f"- LTH supply **> 14.75M BTC** → accelerating accumulation {'🟢' if v_lth and v_lth > 14.75e6 else '⚪'}")
+    st.markdown(f"- Active addresses **> 700K/day** → strong network demand {'🟢' if v_adr and v_adr > 700000 else '⚪'}")
 with w2:
     st.markdown("**Stablecoins**")
     st.markdown(f"- Total reserves **> $80B** → {'🟢 already above' if v_stable and v_stable > 80e9 else '⚪ not yet'}")
