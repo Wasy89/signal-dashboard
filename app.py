@@ -2,10 +2,7 @@ import streamlit as st
 import requests
 import pandas as pd
 import plotly.graph_objects as go
-import plotly.express as px
-from plotly.subplots import make_subplots
 from datetime import datetime, timedelta, timezone
-import time
 
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -15,23 +12,8 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ── Styling ─────────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-    .metric-card {
-        background: #1a1a2e;
-        border-radius: 12px;
-        padding: 16px 20px;
-        border: 1px solid #2a2a4a;
-    }
-    .conviction-score {
-        font-size: 72px;
-        font-weight: 800;
-        line-height: 1;
-    }
-    .signal-bull { color: #00c896; }
-    .signal-bear { color: #ff4b6e; }
-    .signal-neutral { color: #aaaaaa; }
     div[data-testid="stMetric"] {
         background: #1a1a2e;
         border: 1px solid #2a2a4a;
@@ -41,116 +23,178 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ── Sidebar ──────────────────────────────────────────────────────────────────────
+# ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.title("⚙️ Settings")
-    # Use secret if deployed on Streamlit Cloud, otherwise show input
-    default_key = st.secrets.get("GLASSNODE_API_KEY", "") if hasattr(st, "secrets") else ""
-    api_key = st.text_input("Glassnode API Key", type="password",
-                             value=default_key,
-                             help="Get a free key at studio.glassnode.com/settings/api")
-    if not api_key:
-        st.warning("⚠️ API key required. [Get a free key →](https://glassnode.com)", icon="🔑")
     days = st.selectbox("Lookback period", [7, 14, 30, 90], index=2)
-    st.divider()
-    st.caption("Data is fetched live from Glassnode on every load.")
     refresh = st.button("🔄 Refresh data")
+    st.divider()
+    st.caption("Data: [CoinMetrics Community API](https://coinmetrics.io) — free, no key needed.")
 
-# ── Helpers ──────────────────────────────────────────────────────────────────────
-GLASSNODE = "https://api.glassnode.com/v1/metrics"
+# ── Data fetching ─────────────────────────────────────────────────────────────
+COINMETRICS = "https://community-api.coinmetrics.io/v4/timeseries/asset-metrics"
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch(endpoint: str, asset: str, since: int, until: int, api_key: str = "") -> pd.DataFrame:
-    params = {"a": asset, "i": "24h", "s": since, "u": until}
-    if api_key:
-        params["api_key"] = api_key
+def fetch_cm(assets: str, metrics: str, start: str, end: str) -> pd.DataFrame:
+    """Fetch from CoinMetrics Community API. Returns wide DataFrame indexed by date."""
     try:
-        r = requests.get(f"{GLASSNODE}/{endpoint}", params=params, timeout=15)
+        r = requests.get(COINMETRICS, params={
+            "assets": assets,
+            "metrics": metrics,
+            "frequency": "1d",
+            "start_time": start,
+            "end_time": end,
+            "page_size": 10000,
+        }, timeout=20)
         r.raise_for_status()
-        data = r.json()
+        data = r.json().get("data", [])
         if not data:
             return pd.DataFrame()
-        # SSR returns o.v; everything else returns v
-        rows = []
-        for item in data:
-            t = item["t"]
-            v = item.get("v") if item.get("v") is not None else item.get("o", {}).get("v")
-            rows.append({"date": datetime.utcfromtimestamp(t), "value": v})
-        return pd.DataFrame(rows).dropna()
+        df = pd.DataFrame(data)
+        df["time"] = pd.to_datetime(df["time"])
+        df = df.set_index("time").apply(pd.to_numeric, errors="coerce")
+        return df
     except Exception as e:
-        st.warning(f"Failed to fetch {endpoint} ({asset}): {e}")
+        st.error(f"CoinMetrics fetch failed: {e}")
         return pd.DataFrame()
 
-def latest(df: pd.DataFrame) -> float | None:
-    return float(df["value"].iloc[-1]) if not df.empty else None
+if refresh:
+    st.cache_data.clear()
 
-def pct_change(df: pd.DataFrame, n: int = 7) -> float | None:
-    if df.empty or len(df) < n:
-        return None
-    return (df["value"].iloc[-1] - df["value"].iloc[-n]) / df["value"].iloc[-n] * 100
+end_dt   = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+start_dt = end_dt - timedelta(days=days)
+start_s  = start_dt.strftime("%Y-%m-%dT00:00:00Z")
+end_s    = end_dt.strftime("%Y-%m-%dT00:00:00Z")
 
-def signal_tag(bullish: bool | None) -> str:
-    if bullish is True:  return "🟢 Bullish"
-    if bullish is False: return "🔴 Bearish"
-    return "⚪ Neutral"
+with st.spinner("Fetching data from CoinMetrics…"):
+    # BTC: price, exchange supply, exchange flows, 1yr+ held supply, market cap
+    df_btc = fetch_cm(
+        "btc",
+        "PriceUSD,SplyExNtv,FlowInExNtv,FlowOutExNtv,SplyActEver1yr,CapMrktCurUSD",
+        start_s, end_s
+    )
+    # Stablecoins: exchange supply + market cap for SSR
+    df_usdt = fetch_cm("usdt", "SplyExNtv,CapMrktCurUSD", start_s, end_s)
+    df_usdc = fetch_cm("usdc", "SplyExNtv,CapMrktCurUSD", start_s, end_s)
 
-def fmt_large(n: float | None) -> str:
-    if n is None: return "N/A"
-    if abs(n) >= 1e12: return f"${n/1e12:.2f}T"
-    if abs(n) >= 1e9:  return f"${n/1e9:.2f}B"
-    if abs(n) >= 1e6:  return f"${n/1e6:.2f}M"
-    if abs(n) >= 1e3:  return f"{n:,.0f}"
-    return f"{n:.4f}"
+# ── Derived series ────────────────────────────────────────────────────────────
+def col(df, name):
+    return df[name] if (not df.empty and name in df.columns) else pd.Series(dtype=float)
 
-def fmt_btc(n: float | None) -> str:
-    if n is None: return "N/A"
-    return f"{n:,.0f} BTC"
+btc_price    = col(df_btc, "PriceUSD")
+btc_reserve  = col(df_btc, "SplyExNtv")
+btc_inflow   = col(df_btc, "FlowInExNtv")
+btc_outflow  = col(df_btc, "FlowOutExNtv")
+btc_lth      = col(df_btc, "SplyActEver1yr")
+btc_mcap     = col(df_btc, "CapMrktCurUSD")
+usdt_bal     = col(df_usdt, "SplyExNtv")
+usdc_bal     = col(df_usdc, "SplyExNtv")
+usdt_mcap    = col(df_usdt, "CapMrktCurUSD")
+usdc_mcap    = col(df_usdc, "CapMrktCurUSD")
 
-def conviction_score(signals: dict) -> tuple[int, list]:
-    """Returns (score 1-10, breakdown list of (label, points))."""
-    breakdown = []
-    total = 0
+# Net flow = inflow - outflow (positive = net inflow to exchanges, bearish)
+btc_net_flow = (btc_inflow - btc_outflow).rename("NetFlow")
 
-    def add(label, points, condition):
-        nonlocal total
-        pts = points if condition else -points
-        total += pts
-        breakdown.append((label, f"+{pts}" if pts > 0 else str(pts)))
+# Stablecoin total on exchanges (USD value — USDT/USDC are ~$1 each)
+stable_total = (usdt_bal + usdc_bal).rename("StableTotal")
 
-    if signals.get("lth_trend") is not None:
-        add("LTH supply rising", 2, signals["lth_trend"] > 0)
-    if signals.get("net_flow") is not None:
-        add("Exchange net outflow (BTC)", 2, signals["net_flow"] < 0)
-    if signals.get("reserve_trend") is not None:
-        add("Exchange reserve declining", 2, signals["reserve_trend"] < 0)
-    if signals.get("stable_total") is not None:
-        add("Stablecoin reserves > $70B", 1, signals["stable_total"] > 70e9)
-    if signals.get("usdt_flow") is not None:
-        add("USDT flowing into exchanges", 1, signals["usdt_flow"] > 0)
-    if signals.get("ssr") is not None:
-        add("SSR below 6 (high buying power)", 1, signals["ssr"] < 6)
+# SSR = BTC market cap / total stablecoin market cap
+stable_mcap  = (usdt_mcap + usdc_mcap)
+ssr          = (btc_mcap / stable_mcap).rename("SSR")
 
-    # Normalize to 1-10 (max raw = +9, min = -9)
-    score = round((total + 9) / 18 * 9 + 1)
-    score = max(1, min(10, score))
-    return score, breakdown
+# ── Latest values + signals ───────────────────────────────────────────────────
+def latest(s): return float(s.iloc[-1]) if not s.empty else None
+def trend7(s):
+    if s.empty or len(s) < 7: return None
+    return float(s.iloc[-1] - s.iloc[-7])
 
-def score_color(score: int) -> str:
-    if score >= 7: return "#00c896"
-    if score >= 5: return "#f0c040"
+v_price      = latest(btc_price)
+v_reserve    = latest(btc_reserve)
+v_net_flow   = latest(btc_net_flow)
+v_lth        = latest(btc_lth)
+v_usdt       = latest(usdt_bal)
+v_usdc       = latest(usdc_bal)
+v_stable     = latest(stable_total)
+v_ssr        = latest(ssr)
+
+t_reserve    = trend7(btc_reserve)   # negative = declining = bullish
+t_lth        = trend7(btc_lth)       # positive = rising = bullish
+
+# ── Conviction score ──────────────────────────────────────────────────────────
+def conviction(signals):
+    pts, rows = 0, []
+    def add(label, val, bull):
+        nonlocal pts
+        p = val if bull else -val
+        pts += p
+        rows.append((label, f"+{p}" if p > 0 else str(p)))
+    if t_lth        is not None: add("LTH supply (1yr+ held) rising",    2, t_lth > 0)
+    if v_net_flow   is not None: add("BTC exchange net outflow",          2, v_net_flow < 0)
+    if t_reserve    is not None: add("Exchange reserve declining",        2, t_reserve < 0)
+    if v_stable     is not None: add("Stablecoin reserves > $70B",        1, v_stable > 70e9)
+    if v_ssr        is not None: add("SSR below 6 (high buying power)",   1, v_ssr < 6)
+    score = max(1, min(10, round((pts + 8) / 16 * 9 + 1)))
+    return score, rows
+
+score, breakdown = conviction({})
+
+def score_color(s):
+    if s >= 7: return "#00c896"
+    if s >= 5: return "#f0c040"
     return "#ff4b6e"
 
-def make_chart(df: pd.DataFrame, title: str, color: str, fmt: str = ",.0f",
-               zero_line: bool = False) -> go.Figure:
+def fmt_btc(v): return f"{v:,.0f} BTC" if v else "N/A"
+def fmt_usd(v):
+    if v is None: return "N/A"
+    if abs(v) >= 1e12: return f"${v/1e12:.2f}T"
+    if abs(v) >= 1e9:  return f"${v/1e9:.2f}B"
+    if abs(v) >= 1e6:  return f"${v/1e6:.2f}M"
+    return f"${v:,.0f}"
+
+def sig(bull): return "🟢 Bullish" if bull else "🔴 Bearish"
+
+# ── Header ────────────────────────────────────────────────────────────────────
+st.title("📡 BTC On-Chain Signal Dashboard")
+st.caption(f"CoinMetrics Community · {days}-day window · Updated {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC")
+st.divider()
+
+# ── Top metrics row ───────────────────────────────────────────────────────────
+c0, c1, c2, c3, c4, c5 = st.columns([1.2, 1, 1, 1, 1, 1])
+
+with c0:
+    c = score_color(score)
+    st.markdown(f"""
+    <div style='background:#1a1a2e;border:1px solid #2a2a4a;border-radius:12px;
+                padding:16px;text-align:center;height:100%'>
+      <div style='font-size:13px;color:#888;margin-bottom:4px'>Accumulation Conviction</div>
+      <div style='font-size:64px;font-weight:800;color:{c};line-height:1'>{score}</div>
+      <div style='font-size:16px;color:#555'>/ 10</div>
+    </div>""", unsafe_allow_html=True)
+
+p7 = (float(btc_price.iloc[-1]) / float(btc_price.iloc[-7]) - 1) * 100 if len(btc_price) >= 7 else None
+r7 = (t_reserve / float(btc_reserve.iloc[-7]) * 100) if t_reserve and not btc_reserve.empty and len(btc_reserve) >= 7 else None
+l7 = (t_lth / float(btc_lth.iloc[-7]) * 100) if t_lth and not btc_lth.empty and len(btc_lth) >= 7 else None
+
+with c1: st.metric("BTC Price",         f"${v_price:,.0f}" if v_price else "N/A", f"{p7:+.1f}% (7d)" if p7 else None)
+with c2: st.metric("LTH Supply (1yr+)", fmt_btc(v_lth),  f"{l7:+.2f}% (7d)" if l7 else None)
+with c3: st.metric("Exchange Reserve",  fmt_btc(v_reserve), f"{r7:+.2f}% (7d)" if r7 else None, delta_color="inverse")
+with c4: st.metric("Stablecoin Reserves", fmt_usd(v_stable), None)
+with c5: st.metric("SSR", f"{v_ssr:.2f}" if v_ssr else "N/A", "High buying power" if v_ssr and v_ssr < 6 else "Lower buying power", delta_color="normal" if v_ssr and v_ssr < 6 else "inverse")
+
+st.divider()
+
+# ── Chart helper ──────────────────────────────────────────────────────────────
+def chart(series: pd.Series, title: str, color: str, zero_line=False, fmt=".2f") -> go.Figure:
     fig = go.Figure()
-    if df.empty:
-        fig.add_annotation(text="No data", xref="paper", yref="paper",
+    if series.empty:
+        fig.add_annotation(text="No data available", xref="paper", yref="paper",
                            x=0.5, y=0.5, showarrow=False, font_color="#666")
     else:
+        fill_color = color[:-1] + ",0.08)" if color.startswith("rgb") else color
         fig.add_trace(go.Scatter(
-            x=df["date"], y=df["value"],
+            x=series.index, y=series.values,
             mode="lines", line=dict(color=color, width=2),
-            fill="tozeroy", fillcolor=color.replace(")", ",0.08)").replace("rgb", "rgba"),
+            fill="tozeroy", fillcolor=fill_color,
             hovertemplate=f"%{{x|%b %d}}: %{{y:{fmt}}}<extra></extra>",
         ))
         if zero_line:
@@ -159,188 +203,81 @@ def make_chart(df: pd.DataFrame, title: str, color: str, fmt: str = ",.0f",
         title=dict(text=title, font=dict(size=13, color="#ccc")),
         plot_bgcolor="#0f0f1a", paper_bgcolor="#0f0f1a",
         font_color="#ccc", margin=dict(l=0, r=0, t=36, b=0),
-        xaxis=dict(showgrid=False, showline=False, color="#555"),
+        xaxis=dict(showgrid=False, color="#555"),
         yaxis=dict(showgrid=True, gridcolor="#1e1e2e", color="#555"),
-        height=220,
+        height=230,
     )
     return fig
 
-# ── Load data ─────────────────────────────────────────────────────────────────
-if refresh:
-    st.cache_data.clear()
-
-now    = int(datetime.now(timezone.utc).replace(hour=0, minute=0, second=0).timestamp())
-since  = now - days * 86400
-
-with st.spinner("Fetching live data from Glassnode…"):
-    df_price    = fetch("market/price_usd_close",                          "BTC",  since, now, api_key)
-    df_lth      = fetch("supply/lth_sum",                                  "BTC",  since, now, api_key)
-    df_flow     = fetch("transactions/transfers_volume_exchanges_net",      "BTC",  since, now, api_key)
-    df_reserve  = fetch("distribution/balance_exchanges",                  "BTC",  since, now, api_key)
-    df_usdt_bal = fetch("distribution/balance_exchanges",                  "USDT", since, now, api_key)
-    df_usdc_bal = fetch("distribution/balance_exchanges",                  "USDC", since, now, api_key)
-    df_usdt_flow= fetch("transactions/transfers_volume_exchanges_net",      "USDT", since, now, api_key)
-    df_ssr      = fetch("indicators/ssr",                                  "BTC",  since, now, api_key)
-
-# Combined stablecoin total
-if not df_usdt_bal.empty and not df_usdc_bal.empty:
-    df_stable = df_usdt_bal.copy()
-    merged = df_usdt_bal.merge(df_usdc_bal, on="date", suffixes=("_usdt", "_usdc"))
-    df_stable = merged.assign(value=merged["value_usdt"] + merged["value_usdc"])[["date","value"]]
-else:
-    df_stable = pd.DataFrame()
-
-# Signal values
-signals = {
-    "lth_trend":     pct_change(df_lth),
-    "net_flow":      latest(df_flow),
-    "reserve_trend": pct_change(df_reserve),
-    "stable_total":  latest(df_stable),
-    "usdt_flow":     latest(df_usdt_flow),
-    "ssr":           latest(df_ssr),
-}
-score, breakdown = conviction_score(signals)
-
-# ── Header ────────────────────────────────────────────────────────────────────
-st.title("📡 BTC On-Chain Signal Dashboard")
-st.caption(f"Live data · Last updated {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC · {days}-day window")
-st.divider()
-
-# ── Top row: conviction score + key metrics ───────────────────────────────────
-col_score, col_price, col_lth, col_reserve, col_stable, col_ssr = st.columns([1.2,1,1,1,1,1])
-
-with col_score:
-    c = score_color(score)
-    st.markdown(f"""
-    <div style='background:#1a1a2e;border:1px solid #2a2a4a;border-radius:12px;padding:16px;text-align:center'>
-        <div style='font-size:13px;color:#888;margin-bottom:4px'>Accumulation Conviction</div>
-        <div style='font-size:64px;font-weight:800;color:{c};line-height:1'>{score}</div>
-        <div style='font-size:16px;color:#555'>/ 10</div>
-    </div>
-    """, unsafe_allow_html=True)
-
-price_val  = latest(df_price)
-lth_val    = latest(df_lth)
-res_val    = latest(df_reserve)
-stable_val = latest(df_stable)
-ssr_val    = latest(df_ssr)
-
-price_delta = pct_change(df_price, 7)
-lth_delta   = pct_change(df_lth,   7)
-res_delta   = pct_change(df_reserve, 7)
-
-with col_price:
-    st.metric("BTC Price",
-              f"${price_val:,.0f}" if price_val else "N/A",
-              f"{price_delta:+.2f}% (7d)" if price_delta else None)
-
-with col_lth:
-    st.metric("LTH Supply",
-              fmt_btc(lth_val),
-              f"{lth_delta:+.2f}% (7d)" if lth_delta else None)
-
-with col_reserve:
-    st.metric("Exchange Reserve",
-              fmt_btc(res_val),
-              f"{res_delta:+.2f}% (7d)" if res_delta else None,
-              delta_color="inverse")
-
-with col_stable:
-    st.metric("Stablecoin Reserves",
-              fmt_large(stable_val),
-              None)
-
-with col_ssr:
-    st.metric("SSR",
-              f"{ssr_val:.2f}" if ssr_val else "N/A",
-              "Low = bullish" if ssr_val and ssr_val < 6 else "High = caution",
-              delta_color="inverse" if ssr_val and ssr_val >= 6 else "normal")
+# ── BTC charts ────────────────────────────────────────────────────────────────
+st.subheader("📈 BTC On-Chain")
+a, b = st.columns(2)
+with a:
+    st.plotly_chart(chart(btc_price,    "Price (USD)",              "#f7931a", fmt="$,.0f"), use_container_width=True)
+    st.plotly_chart(chart(btc_reserve,  "Exchange Reserve (BTC)",   "#ff6b6b", fmt=",.0f"),  use_container_width=True)
+with b:
+    st.plotly_chart(chart(btc_lth,      "LTH Supply — held 1yr+ (BTC)", "#00c896", fmt=",.0f"), use_container_width=True)
+    st.plotly_chart(chart(btc_net_flow, "Exchange Net Flow (BTC)",  "#7eb3ff", fmt="+,.0f", zero_line=True), use_container_width=True)
 
 st.divider()
 
-# ── Charts ────────────────────────────────────────────────────────────────────
-st.subheader("📈 BTC On-Chain Metrics")
-c1, c2 = st.columns(2)
-with c1:
-    st.plotly_chart(make_chart(df_price,   "Price (USD)",          "#f7931a"), use_container_width=True)
-    st.plotly_chart(make_chart(df_reserve, "Exchange Reserve (BTC)","#ff6b6b",  fmt=",.0f"), use_container_width=True)
-with c2:
-    st.plotly_chart(make_chart(df_lth,     "LTH Supply (BTC)",     "#00c896",  fmt=",.0f"), use_container_width=True)
-    st.plotly_chart(make_chart(df_flow,    "Exchange Net Flow (BTC)","#7eb3ff", fmt="+,.0f", zero_line=True), use_container_width=True)
-
-st.divider()
-st.subheader("💵 Stablecoin Exchange Metrics")
-c3, c4, c5 = st.columns(3)
-with c3:
-    st.plotly_chart(make_chart(df_stable,    "Total Stablecoin Reserves (USD)", "#a78bfa", fmt=",.0f"), use_container_width=True)
-with c4:
-    st.plotly_chart(make_chart(df_usdt_flow, "USDT Net Flow to Exchanges (USD)", "#f472b6", fmt="+,.0f", zero_line=True), use_container_width=True)
-with c5:
-    st.plotly_chart(make_chart(df_ssr,       "SSR (Stablecoin Supply Ratio)",   "#34d399", fmt=".2f"), use_container_width=True)
+# ── Stablecoin charts ─────────────────────────────────────────────────────────
+st.subheader("💵 Stablecoin Metrics")
+d, e, f_ = st.columns(3)
+with d:  st.plotly_chart(chart(stable_total, "Total Stablecoin Reserves on Exchanges", "#a78bfa", fmt=",.0f"), use_container_width=True)
+with e:  st.plotly_chart(chart(usdt_bal,     "USDT on Exchanges",  "#f472b6", fmt=",.0f"), use_container_width=True)
+with f_: st.plotly_chart(chart(ssr,          "SSR (BTC mcap / Stablecoin mcap)", "#34d399", fmt=".2f"), use_container_width=True)
 
 st.divider()
 
-# ── Signal table + conviction breakdown ──────────────────────────────────────
-col_sig, col_break = st.columns([3, 2])
+# ── Signal table + breakdown ──────────────────────────────────────────────────
+left, right = st.columns([3, 2])
 
-with col_sig:
+with left:
     st.subheader("🔎 Signal Summary")
-    flow_val   = latest(df_flow)
-    usdt_f_val = latest(df_usdt_flow)
-
     rows = [
-        ("BTC LTH Supply (7d change)",      f"{lth_delta:+.2f}%"   if lth_delta  else "N/A", lth_delta and lth_delta > 0),
-        ("BTC Exchange Net Flow",            fmt_btc(flow_val),                                flow_val  and flow_val  < 0),
-        ("BTC Exchange Reserve (7d change)", f"{res_delta:+.2f}%"   if res_delta  else "N/A", res_delta and res_delta < 0),
-        ("Total Stablecoin Reserves",        fmt_large(stable_val),                            stable_val and stable_val > 70e9),
-        ("USDT Net Flow to Exchanges",       fmt_large(usdt_f_val) if usdt_f_val else "N/A",  usdt_f_val and usdt_f_val > 0),
-        ("SSR",                              f"{ssr_val:.2f}"       if ssr_val    else "N/A",  ssr_val   and ssr_val   < 6),
+        ("LTH Supply (1yr+ held, 7d change)", f"{t_lth:+,.0f} BTC" if t_lth else "N/A",   sig(t_lth and t_lth > 0)    if t_lth is not None else "⚪ N/A"),
+        ("BTC Exchange Net Flow (latest day)", fmt_btc(v_net_flow),                          sig(v_net_flow and v_net_flow < 0) if v_net_flow is not None else "⚪ N/A"),
+        ("Exchange Reserve (7d change)",       f"{t_reserve:+,.0f} BTC" if t_reserve else "N/A", sig(t_reserve and t_reserve < 0) if t_reserve is not None else "⚪ N/A"),
+        ("Total Stablecoin Reserves",          fmt_usd(v_stable),                            sig(v_stable and v_stable > 70e9) if v_stable is not None else "⚪ N/A"),
+        ("USDT on Exchanges",                  fmt_usd(v_usdt),                              "⚪ Reference"),
+        ("USDC on Exchanges",                  fmt_usd(v_usdc),                              "⚪ Reference"),
+        ("SSR",                                f"{v_ssr:.2f}" if v_ssr else "N/A",           sig(v_ssr and v_ssr < 6)    if v_ssr is not None else "⚪ N/A"),
     ]
-
-    sig_df = pd.DataFrame(rows, columns=["Metric", "Value", "_bull"])
-    sig_df["Signal"] = sig_df["_bull"].map(lambda b: signal_tag(b))
     st.dataframe(
-        sig_df[["Metric", "Value", "Signal"]],
-        use_container_width=True,
-        hide_index=True,
+        pd.DataFrame(rows, columns=["Metric", "Value", "Signal"]),
+        use_container_width=True, hide_index=True,
         column_config={
             "Signal": st.column_config.TextColumn(width="small"),
             "Value":  st.column_config.TextColumn(width="medium"),
         }
     )
 
-with col_break:
+with right:
     st.subheader("🏆 Conviction Breakdown")
     c = score_color(score)
-    st.markdown(f"<h1 style='color:{c};font-size:48px;margin:0'>{score}<span style='font-size:24px;color:#555'> / 10</span></h1>", unsafe_allow_html=True)
-    st.caption("Based on current signal alignment")
-    break_df = pd.DataFrame(breakdown, columns=["Factor", "Points"])
-    st.dataframe(break_df, use_container_width=True, hide_index=True)
+    st.markdown(f"<h1 style='color:{c};font-size:52px;margin:0'>{score}"
+                f"<span style='font-size:22px;color:#555'> / 10</span></h1>",
+                unsafe_allow_html=True)
+    st.caption("Signal alignment score")
+    st.dataframe(pd.DataFrame(breakdown, columns=["Factor", "Points"]),
+                 use_container_width=True, hide_index=True)
 
 st.divider()
 
-# ── Watch levels ─────────────────────────────────────────────────────────────
+# ── Watch levels ──────────────────────────────────────────────────────────────
 st.subheader("👀 Watch Levels")
 w1, w2 = st.columns(2)
 with w1:
     st.markdown("**BTC**")
-    if res_val:
-        breach = "🟢 conviction upgrades" if res_val > 3_000_000 else "🔴 already breached"
-        st.markdown(f"- Exchange reserve **< 3.0M BTC** → {breach}")
-    if lth_val:
-        st.markdown(f"- LTH supply **> 14.75M BTC** → accelerating accumulation")
-    if flow_val:
-        direction = "outflow" if flow_val < 0 else "inflow"
-        st.markdown(f"- Exchange net flow turning positive → distribution caution flag")
+    st.markdown(f"- Exchange reserve **< 3.0M BTC** → {'🟢 already below' if v_reserve and v_reserve < 3e6 else '⚪ not yet reached'}")
+    st.markdown(f"- Net flow turning **positive** for 3+ days → distribution warning 🔴")
+    st.markdown(f"- LTH supply **> 14.75M BTC** → accelerating accumulation {'🟢' if v_lth and v_lth > 14.75e6 else '⚪'}")
 with w2:
     st.markdown("**Stablecoins**")
-    if stable_val:
-        breach = "🟢 buying pressure intensifying" if stable_val > 80e9 else "⚪ not yet reached"
-        st.markdown(f"- Total reserves **> $80B** → {breach}")
-    if ssr_val:
-        breach = "🟢 near peak buying power" if ssr_val < 4 else "⚪ not yet"
-        st.markdown(f"- SSR **< 4.0** → {breach}")
-    st.markdown("- USDT net flow turning negative → capital rotating out, caution")
+    st.markdown(f"- Total reserves **> $80B** → {'🟢 already above' if v_stable and v_stable > 80e9 else '⚪ not yet'}")
+    st.markdown(f"- SSR **< 4.0** → near peak buying power {'🟢' if v_ssr and v_ssr < 4 else '⚪'}")
+    st.markdown(f"- SSR **> 8.0** → buying power depleted 🔴")
 
 st.divider()
-st.caption("Built with Streamlit · Data from Glassnode · Refreshes every hour (cached)")
+st.caption("Data: [CoinMetrics Community API](https://docs.coinmetrics.io/api/v4) · Free, no API key required · Cached 1hr")
